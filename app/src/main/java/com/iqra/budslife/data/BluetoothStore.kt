@@ -23,7 +23,7 @@ interface BudsDao {
     @Query("SELECT * FROM buds")
     fun getAllBuds(): Flow<List<BudsEntity>>
 
-    @Query("SELECT * FROM buds WHERE deviceAddress = :deviceAddress")
+    @Query("SELECT * FROM buds WHERE deviceAddress = :deviceAddress LIMIT 1")
     fun getBudsByAddress(deviceAddress: String): Flow<BudsEntity?>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

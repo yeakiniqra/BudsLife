@@ -14,6 +14,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -28,7 +29,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
@@ -46,6 +49,7 @@ class BluetoothMonitorService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "buds_life_channel"
         private const val CHANNEL_NAME = "Buds Life"
+        private const val BATTERY_CHECK_INTERVAL = 30000L // 30 seconds
     }
 
     override fun onCreate() {
@@ -57,11 +61,22 @@ class BluetoothMonitorService : Service() {
         // Register for Bluetooth events
         registerBluetoothReceivers()
 
-        // Create notification channel (required for Android O+)
+        // Create notification channel
         createNotificationChannel()
 
-        // Start as foreground service
-        startForeground(NOTIFICATION_ID, createForegroundNotification("Monitoring your AirBuds"))
+        // Create the notification
+        val notification = createForegroundNotification("Monitoring your AirBuds")
+
+        // Start as foreground service with proper type specification
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -237,7 +252,7 @@ class BluetoothMonitorService : Service() {
         }
     }
 
-    // Start monitoring a specific device
+    // Start monitoring a specific device - FIXED VERSION
     private fun startDeviceMonitoring(deviceAddress: String) {
         if (monitoringJobs.containsKey(deviceAddress)) {
             return
@@ -247,30 +262,49 @@ class BluetoothMonitorService : Service() {
             try {
                 Log.d(TAG, "Starting to monitor device: $deviceAddress")
 
-                // Connect to the device and get battery level
+                // Connect to the device
                 bluetoothModel.connectToDevice(deviceAddress)
 
-                // Monitor battery level and connected device state
-                bluetoothModel.batteryLevel.collectLatest { batteryLevel ->
-                    batteryLevel?.let { level ->
-                        // Use the connected device from the BluetoothModel
-                        bluetoothModel.connectedDevice.collectLatest { budsEntity: BudsEntity? ->
-                            if (budsEntity != null && budsEntity.deviceAddress == deviceAddress) {
-                                // Check if notification needs to be shown
-                                if (budsEntity.notificationsEnabled &&
-                                    budsEntity.lastBatteryLevel <= budsEntity.batteryThreshold) {
+                // Wait a bit for connection to establish
+                delay(2000)
 
-                                    Log.d(TAG, "Battery low notification for ${budsEntity.deviceName}: ${budsEntity.lastBatteryLevel}%")
-                                    showLowBatteryNotification(
-                                        deviceName = budsEntity.deviceName,
-                                        batteryLevel = budsEntity.lastBatteryLevel,
-                                        deviceAddress = budsEntity.deviceAddress
-                                    )
-                                }
-                            }
+                // Use combine to merge battery level and device info flows
+                combine(
+                    bluetoothModel.batteryLevel,
+                    bluetoothModel.connectedDevice
+                ) { batteryLevel, connectedDevice ->
+                    Pair(batteryLevel, connectedDevice)
+                }.collectLatest { (batteryLevel, connectedDevice) ->
+
+                    // Only process if we have valid data for this specific device
+                    if (connectedDevice != null &&
+                        connectedDevice.deviceAddress == deviceAddress &&
+                        batteryLevel != null &&
+                        batteryLevel > 0) {
+
+                        Log.d(TAG, "Valid battery data for $deviceAddress: $batteryLevel%")
+
+                        // Check if notification needs to be shown
+                        if (connectedDevice.notificationsEnabled &&
+                            batteryLevel <= connectedDevice.batteryThreshold) {
+
+                            Log.d(TAG, "Battery low notification for ${connectedDevice.deviceName}: $batteryLevel%")
+                            showLowBatteryNotification(
+                                deviceName = connectedDevice.deviceName,
+                                batteryLevel = batteryLevel,
+                                deviceAddress = connectedDevice.deviceAddress
+                            )
+                        }
+                    } else {
+                        // If battery level is 0 or invalid, try to refresh
+                        if (connectedDevice?.deviceAddress == deviceAddress) {
+                            Log.d(TAG, "Invalid battery data for $deviceAddress, attempting refresh...")
+                            delay(BATTERY_CHECK_INTERVAL)
+                            bluetoothModel.refreshBatteryLevel(deviceAddress)
                         }
                     }
                 }
+
             } catch (e: SecurityException) {
                 Log.e(TAG, "Permission denied while monitoring device $deviceAddress", e)
             } catch (e: Exception) {
@@ -281,9 +315,18 @@ class BluetoothMonitorService : Service() {
 
     // Stop monitoring a device
     private fun cancelDeviceMonitoring(deviceAddress: String) {
+        Log.d(TAG, "Canceling monitoring for device: $deviceAddress")
         monitoringJobs[deviceAddress]?.cancel()
         monitoringJobs.remove(deviceAddress)
-        bluetoothModel.disconnectDevice()
+
+        // Only disconnect if this was the currently connected device
+        serviceScope.launch {
+            bluetoothModel.connectedDevice.value?.let { connectedDevice ->
+                if (connectedDevice.deviceAddress == deviceAddress) {
+                    bluetoothModel.disconnectDevice()
+                }
+            }
+        }
     }
 
     // Create notification channel

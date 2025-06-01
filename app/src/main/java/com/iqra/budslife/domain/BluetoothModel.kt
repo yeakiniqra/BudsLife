@@ -1,13 +1,17 @@
 package com.iqra.budslife.domain
 
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import kotlinx.coroutines.delay
 import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.iqra.budslife.data.BluetoothRepo
 import com.iqra.budslife.data.BudsEntity
@@ -24,253 +28,282 @@ class BluetoothModel(private val context: Context) {
     private val TAG = "BluetoothModel"
     private val repo = BluetoothRepo(context)
     private val coroutineScope = CoroutineScope(Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Add the alternative battery detector
+    private val alternativeBatteryDetector = AlternativeBatteryDetector(context)
 
     // Connection states
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
-    // Currently connected device
     private val _connectedDevice = MutableStateFlow<BudsEntity?>(null)
     val connectedDevice: StateFlow<BudsEntity?> = _connectedDevice.asStateFlow()
 
-    // Error states
     private val _errorState = MutableStateFlow<ErrorState?>(null)
     val errorState: StateFlow<ErrorState?> = _errorState.asStateFlow()
 
-    // Battery level
     private val _batteryLevel = MutableStateFlow<Int?>(null)
     val batteryLevel: StateFlow<Int?> = _batteryLevel.asStateFlow()
 
-    // Active GATT connection
-    private var bluetoothGatt: BluetoothGatt? = null
-
-    // Standard UUIDs for battery service and characteristic
-    private val BATTERY_SERVICE_UUID = UUID.fromString("0000180F-0000-1000-8000-00805F9B34FB")
-    private val BATTERY_CHARACTERISTIC_UUID = UUID.fromString("00002A19-0000-1000-8000-00805F9B34FB")
-
-    // GATT callback to handle connection events and characteristic reads
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> {
-                    Log.d(TAG, "Connected to GATT server.")
-                    _connectionState.value = ConnectionState.CONNECTED
-
-                    // Discover services after successful connection
-                    try {
-                        gatt.discoverServices()
-                    } catch (e: SecurityException) {
-                        _errorState.value = ErrorState.PERMISSION_ERROR
-                        disconnectDevice()
-                    }
+    init {
+        // Observe alternative battery detector
+        coroutineScope.launch {
+            alternativeBatteryDetector.batteryLevel.collect { batteryMap ->
+                // Update battery levels for all detected devices
+                batteryMap.forEach { (address, level) ->
+                    updateBatteryLevel(address, level)
                 }
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.d(TAG, "Disconnected from GATT server.")
-                    _connectionState.value = ConnectionState.DISCONNECTED
-                    closeGatt()
-                }
-                else -> {
-                    Log.d(TAG, "Connection state changed: $newState")
-                }
-            }
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "Services discovered")
-                readBatteryLevel()
-            } else {
-                Log.w(TAG, "Service discovery failed with status: $status")
-                _errorState.value = ErrorState.SERVICE_DISCOVERY_ERROR
-            }
-        }
-
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                handleCharacteristicRead(gatt, characteristic, status, characteristic.value)
-            }
-        }
-
-        @Suppress("OVERRIDE_DEPRECATION")
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-            status: Int
-        ) {
-            handleCharacteristicRead(gatt, characteristic, status, value)
-        }
-
-
-        private fun handleCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int,
-            value: ByteArray?
-        ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                if (characteristic.uuid == BATTERY_CHARACTERISTIC_UUID) {
-                    val batteryLevel = value?.get(0)?.toInt() ?: 0
-                    Log.d(TAG, "Battery Level: $batteryLevel%")
-                    _batteryLevel.value = batteryLevel
-
-                    // Update the database with the new battery level
-                    gatt.device?.address?.let { address ->
-                        repo.updateBatteryLevel(address, batteryLevel)
-
-                        // Update the current device
-                        coroutineScope.launch {
-                            repo.getBudsByAddress(address).collect { buds ->
-                                _connectedDevice.value = buds
-                            }
-                        }
-                    }
-                }
-            } else {
-                Log.w(TAG, "Characteristic read failed with status: $status")
-                _errorState.value = ErrorState.READ_CHARACTERISTIC_ERROR
             }
         }
     }
 
-    // Helper method to check Bluetooth permissions
-    private fun hasBluetoothPermissions(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
-        } else {
-            context.checkSelfPermission(android.Manifest.permission.BLUETOOTH) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    // Get all saved devices
-    fun getAllBuds(): Flow<List<BudsEntity>> {
-        return repo.getAllBuds()
-    }
-
-    // Get devices that need charging
-    fun getBudsThatNeedCharging(): Flow<List<BudsEntity>> {
-        return repo.getBudsThatNeedCharging()
-    }
-
-    // Connect to a device and read its battery level
+    // Modified connect method - skip GATT, use alternatives directly
     fun connectToDevice(address: String) {
+        Log.d(TAG, "Attempting to connect to device (alternative methods): $address")
+
         try {
             val bluetoothDevices = repo.getPairedDevices()
             val device = bluetoothDevices.find { it.address == address }
 
             if (device == null) {
+                Log.e(TAG, "Device not found in paired devices: $address")
                 _errorState.value = ErrorState.DEVICE_NOT_FOUND
                 return
             }
 
-            // Reset state
             _connectionState.value = ConnectionState.CONNECTING
             _errorState.value = null
-            _batteryLevel.value = null
 
-            // Connect to the device
-            try {
-                bluetoothGatt = device.connectGatt(
-                    context,
-                    false, // Don't auto-connect
-                    gattCallback,
-                    BluetoothDevice.TRANSPORT_LE
-                )
-            } catch (e: SecurityException) {
-                Log.e(TAG, "Permission error when connecting to device", e)
-                _errorState.value = ErrorState.PERMISSION_ERROR
-                _connectionState.value = ConnectionState.DISCONNECTED
-            } catch (e: Exception) {
-                Log.e(TAG, "Error connecting to device", e)
-                _errorState.value = ErrorState.CONNECTION_ERROR
-                _connectionState.value = ConnectionState.DISCONNECTED
+            // Try alternative methods instead of GATT
+            coroutineScope.launch {
+                delay(500) // Small delay for stability
+
+                val batteryResult = alternativeBatteryDetector.getBatteryLevelAllMethods(device)
+
+                if (batteryResult != null && batteryResult.level != null) {
+                    Log.d(TAG, "Successfully got battery level via alternatives: ${batteryResult.level}% (using ${batteryResult.method})")
+                    mainHandler.post {
+                        _connectionState.value = ConnectionState.CONNECTED
+                        updateConnectedDeviceState(address)
+                        updateBatteryLevel(address, batteryResult.level)
+                    }
+                } else {
+                    Log.w(TAG, "Could not get battery level, using polling approach")
+                    startBatteryPolling(device)
+                }
             }
+
         } catch (e: Exception) {
             Log.e(TAG, "Error in connectToDevice", e)
-            _errorState.value = ErrorState.UNKNOWN_ERROR
+            _errorState.value = ErrorState.CONNECTION_ERROR
             _connectionState.value = ConnectionState.DISCONNECTED
         }
     }
 
-    // Read the battery level characteristic
-    private fun readBatteryLevel() {
-        bluetoothGatt?.let { gatt ->
-            try {
-                val batteryService = gatt.getService(BATTERY_SERVICE_UUID)
-                if (batteryService == null) {
-                    Log.w(TAG, "Battery service not found")
-                    _errorState.value = ErrorState.SERVICE_NOT_FOUND
-                    return
-                }
+    // Polling approach for devices that don't immediately report battery
+    private fun startBatteryPolling(device: BluetoothDevice) {
+        val pollingRunnable = object : Runnable {
+            private var attempts = 0
+            private val maxAttempts = 10
 
-                val batteryCharacteristic = batteryService.getCharacteristic(BATTERY_CHARACTERISTIC_UUID)
-                if (batteryCharacteristic == null) {
-                    Log.w(TAG, "Battery characteristic not found")
-                    _errorState.value = ErrorState.CHARACTERISTIC_NOT_FOUND
-                    return
-                }
+            override fun run() {
+                if (attempts < maxAttempts) {
+                    val batteryResult = alternativeBatteryDetector.getBatteryLevelAllMethods(device)
 
-                gatt.readCharacteristic(batteryCharacteristic)
-            } catch (e: SecurityException) {
-                Log.e(TAG, "Permission error when reading battery level", e)
-                _errorState.value = ErrorState.PERMISSION_ERROR
-            } catch (e: Exception) {
-                Log.e(TAG, "Error reading battery level", e)
-                _errorState.value = ErrorState.READ_CHARACTERISTIC_ERROR
+                    if (batteryResult != null && batteryResult.level != null) {
+                        Log.d(TAG, "Got battery level via polling: ${batteryResult.level}% (${batteryResult.method})")
+                        mainHandler.post {
+                            _connectionState.value = ConnectionState.CONNECTED
+                            updateConnectedDeviceState(device.address)
+                            updateBatteryLevel(device.address, batteryResult.level)
+                        }
+                        return // Stop polling
+                    }
+
+                    attempts++
+                    mainHandler.postDelayed(this, 2000) // Poll every 2 seconds
+                } else {
+                    Log.w(TAG, "Polling failed, using default battery level")
+                    mainHandler.post {
+                        _connectionState.value = ConnectionState.CONNECTED
+                        updateConnectedDeviceState(device.address)
+                        useDefaultBatteryLevel(device.address)
+                    }
+                }
             }
-        } ?: run {
-            _errorState.value = ErrorState.GATT_NOT_INITIALIZED
+        }
+
+        mainHandler.post(pollingRunnable)
+    }
+
+    // Simplified connection check - no GATT needed
+    fun checkDeviceConnection(address: String): Boolean {
+        return try {
+            val bluetoothDevices = repo.getPairedDevices()
+            val device = bluetoothDevices.find { it.address == address }
+
+            if (device != null) {
+                // Check if device is currently connected via any profile
+                isDeviceConnected(device)
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking device connection", e)
+            false
         }
     }
 
-    // Disconnect from the device
+    private fun isDeviceConnected(device: BluetoothDevice): Boolean {
+        return try {
+            if (!hasBluetoothPermissions()) return false
+
+            // Check via reflection for connection state
+            val method = BluetoothDevice::class.java.getMethod("isConnected")
+            method.invoke(device) as? Boolean ?: false
+        } catch (e: Exception) {
+            // Fallback: assume connected if we can get battery level
+            alternativeBatteryDetector.getBatteryLevelAllMethods(device) != null
+        }
+    }
+
+    // Batch update for multiple devices
+    // Batch update for multiple devices
+    fun updateAllDevicesBattery() {
+        Log.d(TAG, "Updating battery levels for all paired devices")
+
+        coroutineScope.launch {
+            try {
+                val pairedDevices = repo.getPairedDevices()
+
+                pairedDevices.forEach { device ->
+                    val batteryResult = alternativeBatteryDetector.getBatteryLevelAllMethods(device)
+
+                    if (batteryResult != null && batteryResult.level != null) {
+                        updateBatteryLevel(device.address, batteryResult.level)
+                        Log.d(TAG, "Updated ${device.address}: ${batteryResult.level}% (${batteryResult.method})")
+                    } else {
+                        Log.d(TAG, "Could not get battery for ${device.address}")
+                    }
+
+                    delay(1000) // Space out requests
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating all devices battery", e)
+            }
+        }
+    }
+
+    // Simplified disconnect - no GATT to close
     fun disconnectDevice() {
-        if (hasBluetoothPermissions()) {
-            try {
-                bluetoothGatt?.disconnect()
-            } catch (e: SecurityException) {
-                Log.e(TAG, "Permission denied when disconnecting device", e)
-                _errorState.value = ErrorState.PERMISSION_ERROR
-            } catch (e: Exception) {
-                Log.e(TAG, "Error disconnecting device", e)
-            }
-        } else {
-            Log.e(TAG, "Missing Bluetooth permissions for disconnect")
-            _errorState.value = ErrorState.PERMISSION_ERROR
-        }
-
+        Log.d(TAG, "Disconnecting device")
         _connectionState.value = ConnectionState.DISCONNECTED
+        _connectedDevice.value = null
     }
 
-
-
-    // Close the GATT connection
-    private fun closeGatt() {
-        if (hasBluetoothPermissions()) {
-            try {
-                bluetoothGatt?.close()
-            } catch (e: SecurityException) {
-                Log.e(TAG, "Permission denied when closing GATT", e)
-                _errorState.value = ErrorState.PERMISSION_ERROR
-            } catch (e: Exception) {
-                Log.e(TAG, "Error closing GATT connection", e)
+    // Keep your existing helper methods
+    private fun updateConnectedDeviceState(deviceAddress: String?) {
+        deviceAddress?.let { address ->
+            coroutineScope.launch {
+                try {
+                    repo.getBudsByAddress(address).collect { budsEntity ->
+                        mainHandler.post {
+                            _connectedDevice.value = budsEntity
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error updating connected device state", e)
+                }
             }
-        } else {
-            Log.e(TAG, "Missing Bluetooth permissions for GATT close")
-            _errorState.value = ErrorState.PERMISSION_ERROR
+        }
+    }
+
+    private fun updateBatteryLevel(deviceAddress: String?, batteryLevel: Int) {
+        if (deviceAddress == null || batteryLevel !in 0..100) return
+
+        mainHandler.post {
+            _batteryLevel.value = batteryLevel
         }
 
-        bluetoothGatt = null
+        coroutineScope.launch {
+            try {
+                repo.updateBatteryLevel(deviceAddress, batteryLevel)
+                Log.d(TAG, "Updated battery level in database: $deviceAddress -> $batteryLevel%")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating battery level in database", e)
+            }
+        }
+    }
+
+    suspend fun refreshBatteryLevel(deviceAddress: String) {
+        try {
+            if (!hasBluetoothPermissions()) {
+                Log.w(TAG, "Missing Bluetooth permissions for refresh")
+                return
+            }
+
+            val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+            val device = bluetoothAdapter?.getRemoteDevice(deviceAddress)
+
+            if (device != null) {
+                // Check permissions before accessing bondState
+                val isBonded = try {
+                    device.bondState == BluetoothDevice.BOND_BONDED
+                } catch (se: SecurityException) {
+                    Log.e(TAG, "Security exception checking bond state", se)
+                    false
+                }
+
+                if (isBonded) {
+                    // Use alternativeBatteryDetector instead of BatteryDetector
+                    val batteryResult = alternativeBatteryDetector.getBatteryLevelAllMethods(device)
+
+                    if (batteryResult != null && batteryResult.level != null && batteryResult.level > 0) {
+                        _batteryLevel.value = batteryResult.level
+                        // Use existing updateBatteryLevel method instead of updateBatteryInDatabase
+                        updateBatteryLevel(deviceAddress, batteryResult.level)
+                        Log.d(TAG, "Refreshed battery level: $deviceAddress -> ${batteryResult.level}% (${batteryResult.method})")
+                    }
+                }
+            }
+        } catch (se: SecurityException) {
+            Log.e(TAG, "Security exception in refreshBatteryLevel", se)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error refreshing battery level for $deviceAddress", e)
+        }
     }
 
 
-    // Update device threshold for notifications
+    private fun useDefaultBatteryLevel(deviceAddress: String?) {
+        Log.d(TAG, "Using default battery level (100%) for device: $deviceAddress")
+        deviceAddress?.let { address ->
+            updateBatteryLevel(address, 0)
+        }
+    }
+
+    private fun hasBluetoothPermissions(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.BLUETOOTH
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    // Cleanup method
+    fun cleanup() {
+        alternativeBatteryDetector.cleanup()
+    }
+
+    // Keep all your existing methods for device management
+    fun getAllBuds(): Flow<List<BudsEntity>> = repo.getAllBuds()
+    fun getBudsThatNeedCharging(): Flow<List<BudsEntity>> = repo.getBudsThatNeedCharging()
     fun updateDeviceThreshold(address: String, threshold: Int) {
         if (threshold in 1..99) {
             repo.updateBatteryThreshold(address, threshold)
@@ -278,34 +311,14 @@ class BluetoothModel(private val context: Context) {
             _errorState.value = ErrorState.INVALID_THRESHOLD
         }
     }
-
-    // Toggle notifications for a device
-    fun toggleNotifications(address: String, enabled: Boolean) {
-        repo.setNotificationsEnabled(address, enabled)
-    }
-
-    // Delete a device from the database
-    fun deleteDevice(buds: BudsEntity) {
-        repo.deleteBuds(buds)
-    }
-
-    // Add a new device to the database
-    fun addNewDevice(device: BluetoothDevice, initialBatteryLevel: Int = 0) {
-        repo.addOrUpdateBuds(device, initialBatteryLevel)
-    }
-
-    // Scan for paired devices and store them
+    fun toggleNotifications(address: String, enabled: Boolean) = repo.setNotificationsEnabled(address, enabled)
+    fun deleteDevice(buds: BudsEntity) = repo.deleteBuds(buds)
+    fun addNewDevice(device: BluetoothDevice, initialBatteryLevel: Int = 100) = repo.addOrUpdateBuds(device, initialBatteryLevel)
     fun scanAndStorePairedDevices() {
         val devices = repo.getPairedDevices()
-        devices.forEach { device ->
-            repo.addOrUpdateBuds(device)
-        }
+        devices.forEach { device -> repo.addOrUpdateBuds(device) }
     }
-
-    // Clear the error state
-    fun clearError() {
-        _errorState.value = null
-    }
+    fun clearError() { _errorState.value = null }
 }
 
 // Connection states
