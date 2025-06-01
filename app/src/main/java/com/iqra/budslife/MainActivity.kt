@@ -1,9 +1,17 @@
 package com.iqra.budslife
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,6 +33,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -33,17 +44,116 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.iqra.budslife.presentation.HistoryPage
 import com.iqra.budslife.presentation.HomePage
+import com.iqra.budslife.service.NotificationHandler
 import com.iqra.budslife.ui.theme.BudsLifeTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private val TAG = "MainActivity"
+    private lateinit var notificationHandler: NotificationHandler
+
+    // Permission request launcher for notifications
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            Log.d(TAG, "Notification permission granted")
+            initializeNotificationSystem()
+        } else {
+            Log.w(TAG, "Notification permission denied")
+            handlePermissionDenial()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Initialize notification handler
+        notificationHandler = NotificationHandler(applicationContext)
+
+        // Check and request notification permissions
+        checkNotificationPermission()
+
         setContent {
             BudsLifeTheme {
                 BudsLifeApp()
             }
         }
+    }
+
+    private fun checkNotificationPermission() {
+        // Only need to request POST_NOTIFICATIONS for Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            when {
+                // Permission already granted
+                ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED -> {
+                    Log.d(TAG, "Notification permission already granted")
+                    initializeNotificationSystem()
+                }
+
+                // Should show rationale
+                ActivityCompat.shouldShowRequestPermissionRationale(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) -> {
+                    Log.d(TAG, "Should show rationale for notification permission")
+                    // For this app, we'll just immediately request again
+                    // In a real app, consider showing a dialog explaining why permissions are needed
+                    requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+
+                // Request permission
+                else -> {
+                    Log.d(TAG, "Requesting notification permission")
+                    requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+        } else {
+            // For Android 12 and below, POST_NOTIFICATIONS permission is not required
+            initializeNotificationSystem()
+        }
+    }
+
+    private fun initializeNotificationSystem() {
+        // Schedule battery checks every 30 minutes
+        notificationHandler.scheduleBatteryChecks(30)
+        Log.d(TAG, "Notification system initialized")
+    }
+
+    private fun handlePermissionDenial() {
+        // User has denied permissions - provide a way to enable them in settings
+        Log.w(TAG, "Permission denied, attempting to continue with limited functionality")
+
+        // We'll still try to initialize but with limited capabilities
+        notificationHandler.scheduleBatteryChecks(60) // Longer interval for limited mode
+
+        // In a production app, you might want to show a dialog prompting the user to enable permissions
+        lifecycleScope.launch {
+            // Wait a bit before showing the dialog to avoid overwhelming the user
+            delay(1000)
+            // Here you could show a dialog that allows the user to go to settings
+            // For example:
+            // showEnablePermissionsDialog()
+        }
+    }
+
+    // Helper method to direct user to app settings
+    private fun openAppSettings() {
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", packageName, null)
+            startActivity(this)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // No need to cancel the WorkManager jobs when the activity is destroyed
+        // They'll continue to run in the background
     }
 }
 
